@@ -23,11 +23,23 @@ El hash debe coincidir con el que muestra el servidor. Detén el servidor con Ct
 
 `--connections` admite de 1 a 32 (8 por defecto) y marca el máximo. Si quedan al menos 16 MiB por descargar, Meiloader mide la velocidad y ajusta automáticamente cuántas conexiones usa; en archivos menores abre las conexiones disponibles de inmediato. `--fixed-connections` desactiva el ajuste para comparar resultados. Si el servidor responde con `429`, Meiloader reduce la concurrencia y respeta `Retry-After` cuando indica segundos. Reintenta hasta tres veces los fallos temporales de los tramos paralelos y de la consulta inicial. Cuando un servidor acepta rangos, las conexiones toman nuevos bloques según van terminando. Si el servidor no admite rangos, Meiloader descarga con una conexión. Para archivos menores de 2 MiB también usa una conexión. Nunca reemplaza un archivo de salida existente.
 
+## Aplicación de escritorio
+
+La interfaz de Windows está en `desktop/`. Permite elegir un destino con el diálogo del sistema, añadir varias descargas a una cola y seguir el progreso, la velocidad y las conexiones activas. Usa el mismo motor Rust que la CLI.
+
+```powershell
+cd desktop
+npm install
+npm run tauri dev
+```
+
+Para crear el ejecutable optimizado sin instalador, ejecuta `npm run tauri build` desde `desktop/`. La cola de la interfaz vive en memoria; los bloques parciales siguen en disco y se reanudan al volver a añadir la misma URL y destino. Aún no hay botón de pausa.
+
 ## Estado
 
 Esta versión admite URLs directas. Para archivos con rangos y un `ETag` fuerte, conserva los bloques terminados en archivos `.meiloader.part` y `.meiloader.json`. Si una descarga se interrumpe, repite el mismo comando con la misma URL y ruta de salida para reanudarla. También puedes cambiar `--connections` al reanudar. Si el servidor cambió el archivo, Meiloader conserva el parcial y muestra un error; no mezcla las dos versiones.
 
-Las descargas sin rangos, sin un `ETag` fuerte o menores de 2 MiB usan un temporal que se elimina al interrumpirse. Aún no hay interfaz gráfica.
+Las descargas sin rangos, sin un `ETag` fuerte o menores de 2 MiB usan un temporal que se elimina al interrumpirse.
 
 ## Pruebas
 

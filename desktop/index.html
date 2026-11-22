@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="es">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#101820" />
+    <link rel="stylesheet" href="/src/styles.css" />
+    <title>Meiloader</title>
+    <script type="module" src="/src/main.ts" defer></script>
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="app-header">
+        <div class="brand-mark" aria-hidden="true"><span></span><span></span><span></span></div>
+        <div>
+          <h1>Meiloader</h1>
+          <p>Descargas rápidas, bajo tu control</p>
+        </div>
+        <span class="version">Vista inicial</span>
+      </header>
+
+      <main class="layout">
+        <section class="panel new-download" aria-labelledby="new-title">
+          <div class="section-heading">
+            <div>
+              <span class="eyebrow">COMENZAR</span>
+              <h2 id="new-title">Nueva descarga</h2>
+            </div>
+            <span class="section-icon" aria-hidden="true">↓</span>
+          </div>
+          <p class="section-copy">Pega un enlace directo HTTP o HTTPS y elige dónde guardar el archivo.</p>
+
+          <form id="download-form">
+            <label for="url">Enlace del archivo</label>
+            <input id="url" name="url" type="url" placeholder="https://servidor.com/archivo.zip" autocomplete="off" required />
+
+            <label for="output">Guardar como</label>
+            <div class="output-row">
+              <input id="output" name="output" type="text" placeholder="Elige una ruta o escríbela aquí" autocomplete="off" />
+              <button id="browse" class="secondary-button" type="button">Explorar</button>
+            </div>
+
+            <div class="settings-header">
+              <label for="connections">Conexiones máximas</label>
+              <output id="connection-value" for="connections">8</output>
+            </div>
+            <input id="connections" name="connections" type="range" min="1" max="32" value="8" />
+            <div class="range-labels"><span>1</span><span>32</span></div>
+
+            <label class="check-row" for="fixed">
+              <input id="fixed" name="fixed" type="checkbox" />
+              <span>Usar siempre el máximo de conexiones</span>
+            </label>
+
+            <button class="primary-button" type="submit">Añadir descarga <span aria-hidden="true">→</span></button>
+          </form>
+          <p class="form-note">Meiloader no reemplaza archivos existentes. Para reanudar, usa el mismo enlace y destino.</p>
+        </section>
+
+        <section class="panel downloads" aria-labelledby="downloads-title">
+          <div class="section-heading">
+            <div>
+              <span class="eyebrow">ACTIVIDAD</span>
+              <h2 id="downloads-title">Descargas</h2>
+            </div>
+            <span id="job-count" class="count-badge">0</span>
+          </div>
+          <div id="empty-state" class="empty-state">
+            <div class="empty-icon" aria-hidden="true">↓</div>
+            <h3>Tu lista está vacía</h3>
+            <p>Añade un archivo para comenzar. Las descargas se procesan una tras otra.</p>
+          </div>
+          <div id="job-list" class="job-list" aria-live="polite"></div>
+        </section>
+      </main>
+
+      <footer><span class="footer-dot"></span> Motor HTTP con rangos, reanudación y ajuste automático</footer>
+    </div>
+  </body>
+</html>

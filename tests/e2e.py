@@ -219,6 +219,10 @@ class DownloadTests(unittest.TestCase):
 if __name__ == "__main__":
     if sys.argv[1:] == ["--serve"]:
         server = ThreadingHTTPServer(("127.0.0.1", 8765), Handler)
+        server.requests_lock = threading.Lock()
+        server.ranges_requested = []
+        server.fail_once = False
+        server.etag = '"same-file"'
         print("Servidor de prueba: http://127.0.0.1:8765/ranges", flush=True)
         print(f"SHA-256 esperado: {hashlib.sha256(DATA).hexdigest()}", flush=True)
         try:
