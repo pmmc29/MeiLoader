@@ -1,6 +1,8 @@
 use std::ffi::OsString;
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;
@@ -9,6 +11,7 @@ use reqwest::{
     Client, Response, StatusCode,
     header::{
         ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_RANGE, ETAG, HeaderValue, IF_RANGE, RANGE,
+        RETRY_AFTER,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -16,7 +19,8 @@ use sha2::{Digest, Sha256};
 use tokio::{
     fs::OpenOptions,
     io::{AsyncSeekExt, AsyncWriteExt},
-    sync::Mutex,
+    sync::{Mutex, watch},
+    time::{Instant, interval_at, sleep},
 };
 
 #[derive(Parser, Debug)]
@@ -33,6 +37,9 @@ struct Args {
     /// Máximo de solicitudes simultáneas por archivo
     #[arg(short, long, default_value_t = 8, value_parser = clap::value_parser!(u16).range(1..=32))]
     connections: u16,
+    /// Mantener el máximo de conexiones sin ajuste automático
+    #[arg(long)]
+    fixed_connections: bool,
 }
 
 struct RemoteFile {
@@ -60,6 +67,53 @@ struct ResumeHandle {
     part_path: PathBuf,
 }
 
+struct AutoTuner {
+    active: usize,
+    maximum: usize,
+    best_active: usize,
+    best_rate: f64,
+    sampled: bool,
+    finished: bool,
+}
+
+impl AutoTuner {
+    fn new(maximum: usize) -> Self {
+        Self {
+            active: 1,
+            maximum,
+            best_active: 1,
+            best_rate: 0.0,
+            sampled: false,
+            finished: false,
+        }
+    }
+
+    fn sample(&mut self, bytes_per_second: f64) -> usize {
+        if self.finished {
+            return self.active;
+        }
+        if !self.sampled {
+            self.sampled = true;
+            self.best_rate = bytes_per_second;
+            self.active = (self.active * 2).min(self.maximum);
+            return self.active;
+        }
+        if self.best_rate == 0.0 || bytes_per_second > self.best_rate * 1.10 {
+            self.best_rate = bytes_per_second;
+            self.best_active = self.active;
+            if self.active < self.maximum {
+                self.active = (self.active * 2).min(self.maximum);
+            } else {
+                self.finished = true;
+            }
+        } else {
+            self.active = self.best_active;
+            self.finished = true;
+        }
+        self.active
+    }
+}
+
 #[derive(Debug)]
 struct RangeIgnored;
 
@@ -70,6 +124,21 @@ impl std::fmt::Display for RangeIgnored {
 }
 
 impl std::error::Error for RangeIgnored {}
+
+#[derive(Debug)]
+struct TransientFailure {
+    message: String,
+    retry_after: Option<Duration>,
+    limited: bool,
+}
+
+impl std::fmt::Display for TransientFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
+impl std::error::Error for TransientFailure {}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -93,11 +162,7 @@ async fn main() -> Result<()> {
     let client = Client::builder()
         .build()
         .context("no se pudo crear el cliente HTTP")?;
-    let probe = client
-        .get(&args.url)
-        .header(ACCEPT_ENCODING, "identity")
-        .header(RANGE, "bytes=0-0")
-        .send()
+    let probe = request_file(&client, &args.url, Some("bytes=0-0"))
         .await
         .context("falló la consulta inicial")?;
 
@@ -140,7 +205,14 @@ async fn main() -> Result<()> {
         eprintln!("Descargando {} bytes en {count} conexiones", remote.size);
         let chunk_size = choose_chunk_size(remote.size, count);
         if let Err(error) = download_parallel(
-            &client, &args.url, &temp_path, &remote, count, chunk_size, None,
+            &client,
+            &args.url,
+            &temp_path,
+            &remote,
+            count,
+            chunk_size,
+            None,
+            args.fixed_connections,
         )
         .await
         {
@@ -150,10 +222,7 @@ async fn main() -> Result<()> {
             eprintln!("El servidor dejó de aceptar rangos; reiniciando con una conexión");
             drop(temp);
             temp = tempfile::NamedTempFile::new_in(parent)?;
-            let response = client
-                .get(&args.url)
-                .header(ACCEPT_ENCODING, "identity")
-                .send()
+            let response = request_file(&client, &args.url, None)
                 .await
                 .context("falló la descarga simple")?;
             download_single(response, temp.path()).await?;
@@ -163,10 +232,7 @@ async fn main() -> Result<()> {
         let response = if probe.status() == StatusCode::OK {
             probe
         } else {
-            client
-                .get(&args.url)
-                .header(ACCEPT_ENCODING, "identity")
-                .send()
+            request_file(&client, &args.url, None)
                 .await
                 .context("falló la descarga")?
         };
@@ -177,6 +243,61 @@ async fn main() -> Result<()> {
         .with_context(|| format!("no se pudo guardar {}", args.output.display()))?;
     println!("Descarga completa: {}", args.output.display());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AutoTuner;
+
+    #[test]
+    fn tuner_expands_and_returns_to_best_when_speed_stalls() {
+        let mut tuner = AutoTuner::new(8);
+        assert_eq!(tuner.sample(100.0), 2);
+        assert_eq!(tuner.sample(220.0), 4);
+        assert_eq!(tuner.sample(225.0), 2);
+        assert_eq!(tuner.sample(500.0), 2);
+    }
+}
+
+fn retry_after(response: &Response) -> Option<Duration> {
+    response
+        .headers()
+        .get(RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(|seconds| Duration::from_secs(seconds.min(30)))
+}
+
+async fn request_file(client: &Client, url: &str, range: Option<&str>) -> Result<Response> {
+    for retry in 0..=3 {
+        let mut request = client.get(url).header(ACCEPT_ENCODING, "identity");
+        if let Some(range) = range {
+            request = request.header(RANGE, range);
+        }
+        match request.send().await {
+            Ok(response)
+                if response.status() == StatusCode::TOO_MANY_REQUESTS
+                    || response.status().is_server_error() =>
+            {
+                if retry == 3 {
+                    bail!(
+                        "el servidor devolvió HTTP {} tras tres reintentos",
+                        response.status()
+                    );
+                }
+                sleep(retry_after(&response).unwrap_or(Duration::from_millis(250 * (1 << retry))))
+                    .await;
+            }
+            Ok(response) => return Ok(response),
+            Err(error) => {
+                if retry == 3 {
+                    return Err(error.into());
+                }
+                sleep(Duration::from_millis(250 * (1 << retry))).await;
+            }
+        }
+    }
+    unreachable!()
 }
 
 fn strong_etag(remote: &RemoteFile) -> Option<String> {
@@ -342,6 +463,7 @@ async fn run_resumable(
         count,
         chunk_size,
         Some(&resume),
+        args.fixed_connections,
     )
     .await;
     resume.flush().await?;
@@ -357,10 +479,7 @@ async fn run_resumable(
             .filter(|p| !p.as_os_str().is_empty())
             .unwrap_or_else(|| Path::new("."));
         let temp = tempfile::NamedTempFile::new_in(parent)?;
-        let response = client
-            .get(&args.url)
-            .header(ACCEPT_ENCODING, "identity")
-            .send()
+        let response = request_file(client, &args.url, None)
             .await
             .context("falló la descarga simple")?;
         download_single(response, temp.path()).await?;
@@ -426,10 +545,27 @@ async fn download_single(response: Response, path: &Path) -> Result<()> {
     let mut file = OpenOptions::new().write(true).open(path).await?;
     let mut received = 0_u64;
     let mut stream = response.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.context("se interrumpió la descarga")?;
-        file.write_all(&chunk).await?;
-        received += chunk.len() as u64;
+    let mut last_report = Instant::now();
+    let mut last_bytes = 0_u64;
+    let mut ticker = interval_at(
+        Instant::now() + Duration::from_secs(1),
+        Duration::from_secs(1),
+    );
+    loop {
+        tokio::select! {
+            chunk = stream.next() => {
+                let Some(chunk) = chunk else { break };
+                let chunk = chunk.context("se interrumpió la descarga")?;
+                file.write_all(&chunk).await?;
+                received += chunk.len() as u64;
+            }
+            _ = ticker.tick() => {
+                let now = Instant::now();
+                report_progress(received, expected, received - last_bytes, now.duration_since(last_report), 1, 1);
+                last_report = now;
+                last_bytes = received;
+            }
+        }
     }
     if let Some(expected) = expected {
         if received != expected {
@@ -437,7 +573,35 @@ async fn download_single(response: Response, path: &Path) -> Result<()> {
         }
     }
     file.sync_all().await?;
+    if last_bytes > 0 {
+        eprintln!();
+    }
     Ok(())
+}
+
+fn report_progress(
+    done: u64,
+    total: Option<u64>,
+    delta: u64,
+    elapsed: Duration,
+    active: usize,
+    maximum: usize,
+) {
+    let speed = delta as f64 / elapsed.as_secs_f64().max(0.001) / (1024.0 * 1024.0);
+    if let Some(total) = total.filter(|total| *total > 0) {
+        eprint!(
+            "\r{:.1}% | {:.2} MiB/s | {active}/{maximum} conexiones",
+            done as f64 * 100.0 / total as f64,
+            speed
+        );
+    } else {
+        eprint!(
+            "\r{:.1} MiB | {:.2} MiB/s | {active}/{maximum} conexiones",
+            done as f64 / (1024.0 * 1024.0),
+            speed
+        );
+    }
+    let _ = std::io::stderr().flush();
 }
 
 async fn download_parallel(
@@ -448,38 +612,124 @@ async fn download_parallel(
     count: usize,
     chunk_size: u64,
     resume: Option<&ResumeHandle>,
+    fixed_connections: bool,
 ) -> Result<()> {
     let completed = if let Some(resume) = resume {
         resume.completed().await
     } else {
         vec![false; usize::try_from(remote.size.div_ceil(chunk_size))?]
     };
+    let already_done = completed
+        .iter()
+        .enumerate()
+        .filter(|(_, done)| **done)
+        .map(|(index, _)| (remote.size - index as u64 * chunk_size).min(chunk_size))
+        .sum::<u64>();
+    let remaining = remote.size - already_done;
+    let automatic = !fixed_connections && count > 1 && remaining >= 16 * 1024 * 1024;
+    let initial_active = if automatic { 1 } else { count };
+    let (target_tx, target_rx) = watch::channel(initial_active);
+    let progress = AtomicU64::new(already_done);
+    let throttled = AtomicBool::new(false);
     let next = AtomicU64::new(0);
-    let tasks = (0..count).map(|_| async {
-        let mut file = OpenOptions::new().write(true).open(path).await?;
-        loop {
-            let index = next.fetch_add(1, Ordering::Relaxed) as usize;
-            if index >= completed.len() {
-                break;
+    let tasks = (0..count).map(|worker_id| {
+        let mut target_rx = target_rx.clone();
+        let target_tx = &target_tx;
+        let next = &next;
+        let completed = &completed;
+        let progress = &progress;
+        let throttled = &throttled;
+        async move {
+            let mut file = OpenOptions::new().write(true).open(path).await?;
+            'work: loop {
+                while worker_id >= *target_rx.borrow() {
+                    if next.load(Ordering::Relaxed) as usize >= completed.len() {
+                        break 'work;
+                    }
+                    if target_rx.changed().await.is_err() {
+                        break 'work;
+                    }
+                }
+                let index = next.fetch_add(1, Ordering::Relaxed) as usize;
+                if index >= completed.len() {
+                    target_tx.send_replace(count);
+                    break;
+                }
+                if completed[index] {
+                    continue;
+                }
+                let start = index as u64 * chunk_size;
+                let end = start.saturating_add(chunk_size - 1).min(remote.size - 1);
+                download_range(
+                    client,
+                    url,
+                    &mut file,
+                    remote,
+                    start,
+                    end,
+                    progress,
+                    throttled,
+                    target_tx,
+                    fixed_connections,
+                )
+                .await?;
+                if let Some(resume) = resume {
+                    file.sync_data().await?;
+                    resume.mark_completed(index).await?;
+                }
             }
-            if completed[index] {
-                continue;
+            if resume.is_none() {
+                file.sync_all().await?;
             }
-            let start = index as u64 * chunk_size;
-            let end = start.saturating_add(chunk_size - 1).min(remote.size - 1);
-            download_range(client, url, &mut file, remote, start, end).await?;
-            if let Some(resume) = resume {
-                file.sync_data().await?;
-                resume.mark_completed(index).await?;
-            }
+            Ok::<(), anyhow::Error>(())
         }
-        if resume.is_none() {
-            file.sync_all().await?;
-        }
-        Ok::<(), anyhow::Error>(())
     });
-    try_join_all(tasks).await?;
-    Ok(())
+    let workers = try_join_all(tasks);
+    tokio::pin!(workers);
+    let mut ticker = interval_at(
+        Instant::now() + Duration::from_secs(1),
+        Duration::from_secs(1),
+    );
+    let mut last_report = Instant::now();
+    let mut last_bytes = already_done;
+    let mut tune_at = Instant::now() + Duration::from_secs(2);
+    let mut last_tune = Instant::now();
+    let mut tune_bytes = already_done;
+    let mut tuner = AutoTuner::new(count);
+    let mut reported = false;
+    loop {
+        tokio::select! {
+            result = &mut workers => {
+                if reported { eprintln!(); }
+                return result.map(|_| ());
+            }
+            _ = ticker.tick() => {
+                let now = Instant::now();
+                let done = progress.load(Ordering::Relaxed);
+                let active = *target_tx.borrow();
+                report_progress(done, Some(remote.size), done.saturating_sub(last_bytes), now.duration_since(last_report), active, count);
+                reported = true;
+                last_report = now;
+                last_bytes = done;
+                if throttled.swap(false, Ordering::Relaxed) {
+                    tuner.active = *target_tx.borrow();
+                    tuner.finished = true;
+                }
+                if automatic && now >= tune_at && !tuner.finished {
+                    let rate = done.saturating_sub(tune_bytes) as f64 / now.duration_since(last_tune).as_secs_f64().max(0.001);
+                    let previous = tuner.active;
+                    let active = tuner.sample(rate);
+                    if active != previous {
+                        target_tx.send_replace(active);
+                        eprintln!("\nAjustando conexiones: {previous} -> {active}");
+                    }
+                    last_tune = now;
+                    tune_bytes = done;
+                    tune_at = now + Duration::from_secs(2);
+                }
+            }
+        }
+    }
 }
 
 async fn download_range(
@@ -489,6 +739,64 @@ async fn download_range(
     remote: &RemoteFile,
     start: u64,
     end: u64,
+    progress: &AtomicU64,
+    throttled: &AtomicBool,
+    target: &watch::Sender<usize>,
+    fixed_connections: bool,
+) -> Result<()> {
+    for retry in 0..=3 {
+        let mut written = 0_u64;
+        let result = download_range_once(
+            client,
+            url,
+            file,
+            remote,
+            start,
+            end,
+            progress,
+            &mut written,
+        )
+        .await;
+        if let Err(error) = result {
+            progress.fetch_sub(written, Ordering::Relaxed);
+            if let Some(transient) = error.downcast_ref::<TransientFailure>() {
+                if retry < 3 {
+                    if transient.limited && !fixed_connections {
+                        throttled.store(true, Ordering::Relaxed);
+                        let current = *target.borrow();
+                        let reduced = (current / 2).max(1);
+                        if reduced < current {
+                            target.send_replace(reduced);
+                            eprintln!("\nServidor limitado: {current} -> {reduced} conexiones");
+                        }
+                    }
+                    let delay = transient
+                        .retry_after
+                        .unwrap_or(Duration::from_millis(250 * (1 << retry)));
+                    eprintln!(
+                        "\nReintentando tramo {start}-{end} en {:.1} s: {error}",
+                        delay.as_secs_f64()
+                    );
+                    sleep(delay).await;
+                    continue;
+                }
+            }
+            return Err(error);
+        }
+        return Ok(());
+    }
+    unreachable!()
+}
+
+async fn download_range_once(
+    client: &Client,
+    url: &str,
+    file: &mut tokio::fs::File,
+    remote: &RemoteFile,
+    start: u64,
+    end: u64,
+    progress: &AtomicU64,
+    written: &mut u64,
 ) -> Result<()> {
     let mut request = client
         .get(url)
@@ -499,12 +807,21 @@ async fn download_range(
             request = request.header(IF_RANGE, etag.clone());
         }
     }
-    let response = request
-        .send()
-        .await
-        .with_context(|| format!("falló el tramo {start}-{end}"))?;
+    let response = request.send().await.map_err(|error| TransientFailure {
+        message: format!("falló el tramo {start}-{end}: {error}"),
+        retry_after: None,
+        limited: false,
+    })?;
     if response.status() == StatusCode::OK {
         return Err(RangeIgnored.into());
+    }
+    if response.status() == StatusCode::TOO_MANY_REQUESTS || response.status().is_server_error() {
+        return Err(TransientFailure {
+            message: format!("el tramo {start}-{end} devolvió HTTP {}", response.status()),
+            retry_after: retry_after(&response),
+            limited: response.status() == StatusCode::TOO_MANY_REQUESTS,
+        }
+        .into());
     }
     if response.status() != StatusCode::PARTIAL_CONTENT {
         bail!(
@@ -532,15 +849,26 @@ async fn download_range(
     let mut stream = response.bytes_stream();
     let expected = end - start + 1;
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.with_context(|| format!("se interrumpió el tramo {start}-{end}"))?;
+        let chunk = chunk.map_err(|error| TransientFailure {
+            message: format!("se interrumpió el tramo {start}-{end}: {error}"),
+            retry_after: None,
+            limited: false,
+        })?;
         received += chunk.len() as u64;
         if received > expected {
             bail!("el servidor envió bytes de más para el tramo {start}-{end}");
         }
         file.write_all(&chunk).await?;
+        progress.fetch_add(chunk.len() as u64, Ordering::Relaxed);
+        *written += chunk.len() as u64;
     }
     if received != expected {
-        bail!("tramo incompleto {start}-{end}: {received} de {expected} bytes");
+        return Err(TransientFailure {
+            message: format!("tramo incompleto {start}-{end}: {received} de {expected} bytes"),
+            retry_after: None,
+            limited: false,
+        }
+        .into());
     }
     Ok(())
 }
