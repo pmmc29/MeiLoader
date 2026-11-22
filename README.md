@@ -25,7 +25,9 @@ El hash debe coincidir con el que muestra el servidor. Detén el servidor con Ct
 
 ## Estado
 
-Esta primera versión admite URLs directas y guarda el resultado mediante un archivo temporal. Todavía no conserva descargas interrumpidas, no ajusta automáticamente la concurrencia y no tiene interfaz gráfica. Esas son las próximas etapas del proyecto.
+Esta versión admite URLs directas. Para archivos con rangos y un `ETag` fuerte, conserva los bloques terminados en archivos `.meiloader.part` y `.meiloader.json`. Si una descarga se interrumpe, repite el mismo comando con la misma URL y ruta de salida para reanudarla. También puedes cambiar `--connections` al reanudar. Si el servidor cambió el archivo, Meiloader conserva el parcial y muestra un error; no mezcla las dos versiones.
+
+Las descargas sin rangos, sin un `ETag` fuerte o menores de 2 MiB usan un temporal que se elimina al interrumpirse. Aún no hay ajuste automático de concurrencia ni interfaz gráfica.
 
 ## Pruebas
 
